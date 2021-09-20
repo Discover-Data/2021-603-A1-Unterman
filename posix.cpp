@@ -11,11 +11,23 @@
 
 using namespace std;
 
-typedef struct thread_data{
+pthread_mutex_t predlock;
+pthread_mutex_t classlock;
+
+struct knnVals{
     int* predictions;
-    float* candidates;
+    int num_classes;
     int* classCounts;
-}thread_data;
+} knnVals;
+
+struct parameters{
+    struct knnVals* vals;
+    ArffData* train;
+    ArffData* test;
+    int k;
+    int queryIndex;
+    int queryEnd;
+} parameters;
 
 float distance(ArffInstance* a, ArffInstance* b) {
     float sum = 0;
@@ -27,76 +39,117 @@ float distance(ArffInstance* a, ArffInstance* b) {
 
     return sum;
 }
+void* innerKNN(void * parameters){
+    struct parameters* myParams = (struct parameters*) parameters;
+    struct knnVals* val = myParams->vals;
+    ArffData* train = myParams->train;
+    ArffData* test = myParams->test;
+    int k = myParams->k;
+    int queryIndex = myParams->queryIndex;
+    int queryEnd = myParams->queryEnd;
 
-void* innerKNN(void *arg){
-    for(int keyIndex = 0; keyIndex < train->num_instances(); keyIndex++) {
+    for(;queryIndex < queryEnd; queryIndex++){
+        // stores k-NN candidates for a query vector as a sorted 2d array. First element is inner product, second is class.
+        float* candidates = (float*) calloc(k*2, sizeof(float));
+        for(int i = 0; i < 2*k; i++){ candidates[i] = FLT_MAX; }
 
-        float dist = distance(test->get_instance(queryIndex), train->get_instance(keyIndex));
+        for(int keyIndex = 0; keyIndex < train->num_instances(); keyIndex++){
+            float dist = distance(test->get_instance(queryIndex), train->get_instance(keyIndex));
 
-        // Add to our candidates
-        for(int c = 0; c < k; c++){
-            if(dist < candidates[2*c]){
-                // Found a new candidate
-                // Shift previous candidates down by one
-                for(int x = k-2; x >= c; x--) {
-                    candidates[2*x+2] = candidates[2*x];
-                    candidates[2*x+3] = candidates[2*x+1];
+            for(int c = 0; c < k; c++){
+                if(dist < candidates[2*c]){
+                    // Found a new candidate
+                    // Shift previous candidates down by one
+                    for(int x = k-2; x >= c; x--) {
+                        candidates[2*x+2] = candidates[2*x];
+                        candidates[2*x+3] = candidates[2*x+1];
+                    }
+                    // Set key vector as potential k NN
+                    candidates[2*c] = dist;
+                    candidates[2*c+1] = train->get_instance(keyIndex)->get(train->num_attributes() - 1)->operator float(); // class value
+
+                    break;
                 }
-
-                // Set key vector as potential k NN
-                candidates[2*c] = dist;
-                candidates[2*c+1] = train->get_instance(keyIndex)->get(train->num_attributes() - 1)->operator float(); // class value
-
-                break;
             }
         }
-    }
-
-    // Bincount the candidate labels and pick the most common
-    for(int i = 0; i < k;i++){
-        classCounts[(int)candidates[2*i+1]] += 1;
-    }
-
-    int max = -1;
-    int max_index = 0;
-    for(int i = 0; i < num_classes;i++){
-        if(classCounts[i] > max){
-            max = classCounts[i];
-            max_index = i;
+        // Bincount the candidate labels and pick the most common
+        pthread_mutex_lock(&classlock);
+        for(int i = 0; i < k;i++){
+            val->classCounts[(int)candidates[2*i+1]] += 1;
         }
+        pthread_mutex_unlock(&classlock);
+
+        int max = -1;
+        int max_index = 0;
+
+        for(int i = 0; i < val->num_classes;i++){
+            if(val->classCounts[i] > max){
+                pthread_mutex_lock(&classlock);
+                max = val->classCounts[i];
+                pthread_mutex_unlock(&classlock);
+                max_index = i;
+            }
+        }
+
+        pthread_mutex_lock(&predlock);
+        val->predictions[queryIndex] = max_index;
+        pthread_mutex_unlock(&predlock);
+
+        pthread_mutex_lock(&classlock);
+        memset(val->classCounts, 0, val->num_classes * sizeof(int));
+        pthread_mutex_unlock(&classlock);
+
+        free(candidates);
     }
-
-    predictions[queryIndex] = max_index;
-
-    for(int i = 0; i < 2*k; i++){ candidates[i] = FLT_MAX; }
-    memset(classCounts, 0, num_classes * sizeof(int));
+    return NULL;
 }
+int* KNN(ArffData* train, ArffData* test, int k, int numThreads) {
+    // Implements a sequential kNN where for each candidate query an in-place priority queue is maintained to identify the kNN's.
+    struct knnVals val;
+    struct knnVals* ptr_val;
+    // predictions is the array where you have to return the class predicted (integer) for the test dataset instances
+    val.predictions = (int*)malloc(test->num_instances() * sizeof(int));
+    val.num_classes = train->num_classes();
+    // Stores bincounts of each class over the final set of candidate NN
+    val.classCounts = (int*)calloc(val.num_classes, sizeof(int));
+    ptr_val = &val;
 
-int* KNN(ArffData* train, ArffData* test, int k) {
-    thread_data tdata;
-    tdata.predictions = (int*)malloc(test->num_instances()*sizeof(int));
-    tdata.candidates = (float*)calloc(k*2, sizeof(float));
-    for(int i = 0; i < 2*k; i++){ tdata.candidates[i] = FLT_MAX; }
-    int num_classes = train->num_classes();
-    tdata.classCounts = (int*)calloc(num_classes, sizeof(int));
-    threads = (pthread_t*)malloc(n_threads * sizeof(pthread_t));
+    // tid
+    pthread_t tid;
 
-    int queryIndex = 0;
-    int joinBreakpoint = n_threads;
-    while(queryIndex < test->num_instances()){
-        for(i = 0; i < n_threads; i++) {
+    // Section query based on number of threads
+    // If the number of threads is greater than the number of instances, only utilize to the number of threads
+    int section =  test->num_instances() / numThreads;
+    int* sectionedArray = new int[numThreads+1];
 
-            pthread_create(&threads[i], NULL, innerKNN, (void *)&tdata;
-            queryIndex++;
-            if (queryIndex >= test->num_instances())
-                joinBreakpoint = i;
-                break;
+    if(section <= 0){
+        sectionedArray = new int[test->num_instances()];
+        for(int i=0; i <= test->num_instances(); i++){
+            sectionedArray[i] = i;
         }
-
-        for(i = 0; i < joinBreakpoint; i++)
-            pthread_join(threads[i],NULL);
-
+    }else{
+        for(int i=0; i <= numThreads; i++){
+            sectionedArray[i] = i * section;
+        }
+        if(test->num_instances() % numThreads == 0){
+            sectionedArray[numThreads-1] += test->num_instances() % numThreads;
+        }
     }
+    // Run each thread on the sections
+    for(int i=0; i<numThreads; i++){
+        struct parameters p;
+        p.vals = ptr_val;
+        p.train = train;
+        p.test = test;
+        p.k = k;
+        p.queryIndex = sectionedArray[i];
+        p.queryEnd = sectionedArray[i+1];
+
+        struct parameters* pPtr;
+        pPtr = &p;
+        pthread_create(&tid, NULL, innerKNN, (void*) pPtr);
+    }
+    return val.predictions;
 }
 
 int* computeConfusionMatrix(int* predictions, ArffData* dataset)
@@ -142,22 +195,31 @@ int main(int argc, char *argv[]){
     ArffData *train = parserTrain.parse();
     ArffData *test = parserTest.parse();
 
-    struct timespec start, end;
-    int* predictions = NULL;
+    int* numThreadsArr = new int[8];
+    for(int i=0; i<8; i++){
+        numThreadsArr[i] = pow(2, i);
+    }
+    for(int i=0; i < 8; i++){
+        printf("Number of threads: %i\n", numThreadsArr[i]);
 
-    clock_gettime(CLOCK_MONOTONIC_RAW, &start);
+        struct timespec start, end;
+        int* predictions = NULL;
 
-    predictions = KNN(train, test, k);
 
-    clock_gettime(CLOCK_MONOTONIC_RAW, &end);
+        clock_gettime(CLOCK_MONOTONIC_RAW, &start);
 
-    // Compute the confusion matrix
-    int* confusionMatrix = computeConfusionMatrix(predictions, test);
-    // Calculate the accuracy
-    float accuracy = computeAccuracy(confusionMatrix, test);
+        predictions = KNN(train, test, k, numThreadsArr[i]);
 
-    uint64_t diff = (1000000000L * (end.tv_sec - start.tv_sec) + end.tv_nsec - start.tv_nsec) / 1e6;
+        clock_gettime(CLOCK_MONOTONIC_RAW, &end);
 
-    printf("The %i-NN classifier for %lu test instances on %lu train instances required %llu ms CPU time. Accuracy was %.4f\n", k, test->num_instances(), train->num_instances(), (long long unsigned int) diff, accuracy);
+        // Compute the confusion matrix
+        int* confusionMatrix = computeConfusionMatrix(predictions, test);
+        // Calculate the accuracy
+        float accuracy = computeAccuracy(confusionMatrix, test);
 
+        uint64_t diff = (1000000000L * (end.tv_sec - start.tv_sec) + end.tv_nsec - start.tv_nsec) / 1e6;
+
+        printf("The %i-NN classifier for %lu test instances on %lu train instances required %llu ms CPU time. Accuracy was %.4f\n", k, test->num_instances(), train->num_instances(), (long long unsigned int) diff, accuracy);
+
+    }
 }
