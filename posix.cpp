@@ -27,6 +27,7 @@ struct parameters{
     int k;
     int queryIndex;
     int queryEnd;
+    int numInstances;
 } parameters;
 
 float distance(ArffInstance* a, ArffInstance* b) {
@@ -47,13 +48,14 @@ void* innerKNN(void * parameters){
     int k = myParams->k;
     int queryIndex = myParams->queryIndex;
     int queryEnd = myParams->queryEnd;
+    int numInstances = myParams->numInstances;
 
     for(;queryIndex < queryEnd; queryIndex++){
         // stores k-NN candidates for a query vector as a sorted 2d array. First element is inner product, second is class.
         float* candidates = (float*) calloc(k*2, sizeof(float));
         for(int i = 0; i < 2*k; i++){ candidates[i] = FLT_MAX; }
 
-        for(int keyIndex = 0; keyIndex < train->num_instances(); keyIndex++){
+        for(int keyIndex = 0; keyIndex < numInstances; keyIndex++){
             float dist = distance(test->get_instance(queryIndex), train->get_instance(keyIndex));
 
             for(int c = 0; c < k; c++){
@@ -115,26 +117,25 @@ int* KNN(ArffData* train, ArffData* test, int k, int numThreads) {
     ptr_val = &val;
 
     // tid
-    pthread_t tid;
+    pthread_t* threads = (pthread_t*)malloc(numThreads*sizeof(pthread_t));
 
+    int numInstances = test->num_instances();
     // Section query based on number of threads
-    // If the number of threads is greater than the number of instances, only utilize to the number of threads
-    int section =  test->num_instances() / numThreads;
+    // If the number of threads is greater than the number of instances, only utilize to the number of instances
+    int section =  numInstances / numThreads;
+    if(section <= 0){
+        section = 1;
+        numThreads = numInstances;
+    }
     int* sectionedArray = new int[numThreads+1];
 
-    if(section <= 0){
-        sectionedArray = new int[test->num_instances()];
-        for(int i=0; i <= test->num_instances(); i++){
-            sectionedArray[i] = i;
-        }
-    }else{
-        for(int i=0; i <= numThreads; i++){
-            sectionedArray[i] = i * section;
-        }
-        if(test->num_instances() % numThreads == 0){
-            sectionedArray[numThreads-1] += test->num_instances() % numThreads;
-        }
+    for(int i=0; i <= numThreads; i++){
+        sectionedArray[i] = i * section;
     }
+    if(numInstances % numThreads == 0){
+        sectionedArray[numThreads-1] += numInstances % numThreads;
+    }
+
     // Run each thread on the sections
     for(int i=0; i<numThreads; i++){
         struct parameters p;
@@ -144,10 +145,15 @@ int* KNN(ArffData* train, ArffData* test, int k, int numThreads) {
         p.k = k;
         p.queryIndex = sectionedArray[i];
         p.queryEnd = sectionedArray[i+1];
+        p.numInstances = p.test->num_instances();
 
         struct parameters* pPtr;
         pPtr = &p;
-        pthread_create(&tid, NULL, innerKNN, (void*) pPtr);
+        pthread_create(&threads[i], NULL, innerKNN, (void*) pPtr);
+    }
+    // join them to main before predictions
+    for(int i=0; i < numThreads; i++){
+        pthread_join(threads[i], NULL);
     }
     return val.predictions;
 }
@@ -181,45 +187,37 @@ float computeAccuracy(int* confusionMatrix, ArffData* dataset)
 
 int main(int argc, char *argv[]){
 
-    if(argc != 4)
+    if(argc != 5)
     {
-        cout << "Usage: ./main datasets/train.arff datasets/test.arff k" << endl;
+        cout << "Usage: ./main datasets/train.arff datasets/test.arff k numThreads" << endl;
         exit(0);
     }
 
     int k = strtol(argv[3], NULL, 10);
-
+    int numThreads = strtol(argv[4], NULL, 10);
     // Open the datasets
     ArffParser parserTrain(argv[1]);
     ArffParser parserTest(argv[2]);
     ArffData *train = parserTrain.parse();
     ArffData *test = parserTest.parse();
 
-    int* numThreadsArr = new int[8];
-    for(int i=0; i<8; i++){
-        numThreadsArr[i] = pow(2, i);
-    }
-    for(int i=0; i < 8; i++){
-        printf("Number of threads: %i\n", numThreadsArr[i]);
-
-        struct timespec start, end;
-        int* predictions = NULL;
+    struct timespec start, end;
+    int* predictions = NULL;
 
 
-        clock_gettime(CLOCK_MONOTONIC_RAW, &start);
+    clock_gettime(CLOCK_MONOTONIC_RAW, &start);
 
-        predictions = KNN(train, test, k, numThreadsArr[i]);
+    predictions = KNN(train, test, k, numThreads);
 
-        clock_gettime(CLOCK_MONOTONIC_RAW, &end);
+    clock_gettime(CLOCK_MONOTONIC_RAW, &end);
 
-        // Compute the confusion matrix
-        int* confusionMatrix = computeConfusionMatrix(predictions, test);
-        // Calculate the accuracy
-        float accuracy = computeAccuracy(confusionMatrix, test);
+    // Compute the confusion matrix
+    int* confusionMatrix = computeConfusionMatrix(predictions, test);
+    // Calculate the accuracy
+    float accuracy = computeAccuracy(confusionMatrix, test);
 
-        uint64_t diff = (1000000000L * (end.tv_sec - start.tv_sec) + end.tv_nsec - start.tv_nsec) / 1e6;
+    uint64_t diff = (1000000000L * (end.tv_sec - start.tv_sec) + end.tv_nsec - start.tv_nsec) / 1e6;
 
-        printf("The %i-NN classifier for %lu test instances on %lu train instances required %llu ms CPU time. Accuracy was %.4f\n", k, test->num_instances(), train->num_instances(), (long long unsigned int) diff, accuracy);
-
-    }
+    printf("The %i-NN %i-Thread classifier for %lu test instances on %lu train instances required %llu ms CPU time. Accuracy was %.4f\n", k, numThreads,
+           test->num_instances(), train->num_instances(), (long long unsigned int) diff, accuracy);
 }
