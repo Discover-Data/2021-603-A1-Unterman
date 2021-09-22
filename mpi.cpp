@@ -12,12 +12,6 @@
 
 using namespace std;
 
-
-struct tuple{
-    int queryIndex;
-    int maxIndex;
-} tuple;
-
 float distance(ArffInstance* a, ArffInstance* b) {
     float sum = 0;
 
@@ -33,13 +27,15 @@ int* KNN(ArffData* train, ArffData* test, int k, int queryIndex, int queryEnd) {
     // Implements a sequential kNN where for each candidate query an in-place priority queue is maintained to identify the kNN's.
 
     // predictions is the array where you have to return the class predicted (integer) for the test dataset instances
-    int* predictions = (int*)malloc(test->num_instances() * sizeof(int));
+    int predSize = queryEnd - queryIndex;
+    int* predictions = (int*)calloc(predSize, sizeof(int));
 
     // stores k-NN candidates for a query vector as a sorted 2d array. First element is inner product, second is class.
     float* candidates = (float*) calloc(k*2, sizeof(float));
     for(int i = 0; i < 2*k; i++){ candidates[i] = FLT_MAX; }
 
     int num_classes = train->num_classes();
+    int baseIndex = queryIndex;
 
     // Stores bincounts of each class over the final set of candidate NN
     int* classCounts = (int*)calloc(num_classes, sizeof(int));
@@ -83,7 +79,7 @@ int* KNN(ArffData* train, ArffData* test, int k, int queryIndex, int queryEnd) {
             }
         }
 
-        predictions[queryIndex] = max_index;
+        predictions[queryIndex-baseIndex] = max_index;
 
         for(int i = 0; i < 2*k; i++){ candidates[i] = FLT_MAX; }
         memset(classCounts, 0, num_classes * sizeof(int));
@@ -126,10 +122,18 @@ int main(int argc, char *argv[]){
     MPI_Comm_size(MPI_COMM_WORLD, &size);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
 
-    int indexes[2];
+    struct timespec start, end;
+    int* predictions;
+    int* counts = NULL;
+    int* displacement = NULL;
+    int* solution = NULL;
 
-    if(argc != 4)
-    {
+    int solutionSize;
+    int index[2];
+    int* partialSolution;
+
+
+    if(argc != 4){
         cout << "Usage: ./main datasets/train.arff datasets/test.arff k" << endl;
         exit(0);
     }
@@ -142,11 +146,7 @@ int main(int argc, char *argv[]){
     ArffData *train = parserTrain.parse();
     ArffData *test = parserTest.parse();
 
-
-
     if(size == 1){
-        struct timespec start, end;
-        int* predictions = NULL;
 
         clock_gettime(CLOCK_MONOTONIC_RAW, &start);
 
@@ -162,84 +162,76 @@ int main(int argc, char *argv[]){
         uint64_t diff = (1000000000L * (end.tv_sec - start.tv_sec) + end.tv_nsec - start.tv_nsec) / 1e6;
 
         printf("The %i-NN classifier for %lu test instances on %lu train instances required %llu ms CPU time. Accuracy was %.4f\n", k, test->num_instances(), train->num_instances(), (long long unsigned int) diff, accuracy);
-
-    }else{
-        // Figure out the sections on data by which to operate
-        size -= 1;  // do no calculation in main proc
-        int numInstances = test->num_instances();
-        int section = numInstances / size;
-        if(section<=0){
+    }else if(rank==0){
+        // Get how large each section to process should be
+        int calculatedSize = size;
+        int section = test->num_instances() / calculatedSize;
+        // If the number of processes is greater than the number of instances, treat the number of sections as 1
+        if(section <= 0){
+            calculatedSize = test->num_instances();
             section = 1;
-            size = numInstances;
         }
-        struct timespec start, end;
+        // Create an array representing the boundaries i.e. 2 procs = [0 40 80]
+        int* boundaries = new int[calculatedSize+1];
+        // 0 is always the starting boundary
+        boundaries[0] = 0;
+        for(int i=1; i <= calculatedSize; i++){
+            boundaries[i] = section*i;
+        }
+        // If the amount of instances doesn't divide evenly into each process, add the remainder to the final section
+        // If there were 3 procs, the array would be [0 26 52 80]
+        int modulo = test->num_instances() % calculatedSize;
+        if(modulo != 0){
+            boundaries[calculatedSize] += modulo;
+        }
+        // Transmit a set of indexes to each of the helper processes.  [0 26] to 0, [26 52] to 1, [52 80] to 2
+        clock_gettime(CLOCK_MONOTONIC_RAW, &start);
+        for(int i=0; i<size; i++){
+            MPI_Send(boundaries+i, 2, MPI_INT, i, 1, MPI_COMM_WORLD);
+        }
+    }
+    // Each process recieves their boundaries to index
+    MPI_Recv(&index, 2, MPI_INT, 0, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    // Each process performs KNN on their boundaries and saves the partial KNN Solution
+    solutionSize = index[1] - index[0];
+    partialSolution = KNN(train, test, k, index[0], index[1]);
+    //Gather all sizes of each array
+    if(rank==0)
+        counts = (int*) malloc(size*sizeof(int));
+    MPI_Gather(&solutionSize, 1, MPI_INT, counts, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    // inside of 0, all KNN are combined in rank order
 
-        if(rank==0){
-            int* sectionedArray = new int[size+1];
-            for(int i = 0; i <= size; i++){sectionedArray[i]=i*section;}
-            if(numInstances % size != 0){
-                sectionedArray[size] = sectionedArray[size] + (numInstances % size);
-            }
-            clock_gettime(CLOCK_MONOTONIC_RAW, &start);
-            // Now that we have all the sections found out, we just need to send the beginning and ending
-            // index for the KNN Calculation.
-            for(int i = 0; i<size; i++){
-                MPI_Send(sectionedArray+i, 2, MPI_INT, i+1, 1,  MPI_COMM_WORLD);
-            }
-        }else{
-            MPI_Recv(&indexes, 2, MPI_INT,0, 1, MPI_COMM_WORLD, MPI_STATUSES_IGNORE);
-            int predLen = indexes[1] - indexes[0];
-            int* predictions = (int*)calloc(test->num_instances(), sizeof(int));
-            predictions = KNN(train, test, k, indexes[0], indexes[1]);
-            // send the predictions array, we can reconstruct the query indexes using the rank
-            MPI_Send(&predictions, predLen, MPI_INT, 0, 1, MPI_COMM_WORLD);
+    if(rank == 0) {
+        // create displacement array, each should follow right after the other
+        displacement = (int *) malloc(size * sizeof(int));
+        displacement[0] = 0;
+        int sum = 0;
+        for (int i = 1; i < size; i++){
+            displacement[i] = counts[i] + sum;
+            sum += counts[i];
         }
-        MPI_Barrier(MPI_COMM_WORLD);
-        if(rank==0){
-            int* fullPred = (int*)calloc(test->num_instances(), sizeof(int));
-            for(int i=1; i<size+1;i++){
-                // For every case except the last one the number of predictions will be the section number
-                if(i != size-1){
-                    int* partialPred = (int*)calloc(section, sizeof(int));
-                    MPI_Recv(partialPred, section, MPI_INT, i, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-                    printf("Partial Predictions: ");
-                    for(int i=0; i<80; i++){
-                        printf("%d ", partialPred[i]);
-                    }
-                    printf("\n");
-                    // Add predictions to full
-                    for(int i=rank*section; i<(rank+1)*section; i++){
-                        int temp = partialPred[i-(rank*section)];
-                        fullPred[i] = temp;
-                    }
-                }else{
-                    int modulo = numInstances % size;
-                    int* partialPred = (int*)calloc((section+modulo), sizeof(int));
-                    MPI_Recv(partialPred, (section + modulo), MPI_INT, i, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-                    printf("Partial Predictions: ");
-                    for(int i=0; i<80; i++){
-                        printf("%d ", partialPred[i]);
-                    }
-                    printf("\n");
-                    // Add prediction to full including modulo
-                    for(int i=rank*section; i< (rank+1)*section+modulo; i++){
-                        int temp = partialPred[i-(rank*section)];
-                        fullPred[i] = temp;
-                    }
-                }
-            }
-            printf("Coalesced Predictions: ");
-            for(int i=0; i<80; i++){
-                printf("%d ", fullPred[i]);
-            }
-            printf("\n");
-            // Compute the confusion matrix
-            int* confusionMatrix = computeConfusionMatrix(fullPred, test);
-            // Calculate the accuracy
-            float accuracy = computeAccuracy(confusionMatrix, test);
+        // allocate an array for partial solutions
+        solution = (int *) malloc(test->num_instances() * sizeof(int));
+    }
+    // Wait for all KNN to finish before gathering
+    MPI_Barrier(MPI_COMM_WORLD);
+    MPI_Gatherv(partialSolution, solutionSize, MPI_INT, solution, counts, displacement, MPI_INT,
+                0, MPI_COMM_WORLD);
+    if(rank == 0){
+        // Accuracy is calculated and finals are produced
+        clock_gettime(CLOCK_MONOTONIC_RAW, &end);
+        // Compute the confusion matrix
+        int* confusionMatrix = computeConfusionMatrix(solution, test);
+        // Calculate the accuracy
+        float accuracy = computeAccuracy(confusionMatrix, test);
 
-            printf("The %i-NN classifier for %lu test instances on %lu train instances required %llu ms CPU time. Accuracy was %.4f\n", k, test->num_instances(), train->num_instances(), (long long unsigned int) 999, accuracy);
-        }
+        uint64_t diff = (1000000000L * (end.tv_sec - start.tv_sec) + end.tv_nsec - start.tv_nsec) / 1e6;
+
+        printf("The %i-NN classifier for %lu test instances on %lu train instances required %llu ms CPU time. Accuracy was %.4f\n", k, test->num_instances(), train->num_instances(), (long long unsigned int) diff, accuracy);
+
+        free(solution);
+        free(displacement);
+        free(counts);
     }
     MPI_Finalize();
 }
